@@ -113,6 +113,8 @@ def _cumsum_scatter_gather_update_gptoss_expert_blocked(
     valid_rows   = T2Ei.to(torch.int32).sum(dim=1).unsqueeze(1)
     row_range    = torch.arange(packed_chunk_size, dtype=torch.int32, device=x.device).unsqueeze(0)
     x_expanded   = x.unsqueeze(0).expand(batch_size, -1, -1)
+    _fp16_min    = torch.tensor(torch.finfo(torch.float16).min, dtype=x.dtype, device=x.device)
+    _limit       = torch.tensor(limit, dtype=x.dtype, device=x.device)
 
     for packed_start in range(0, seq_len, packed_chunk_size):
         packed_stop      = packed_start + packed_chunk_size
@@ -121,8 +123,6 @@ def _cumsum_scatter_gather_update_gptoss_expert_blocked(
 
         gate = (x_chunk @ W_g) + b_g.unsqueeze(1)
         up   = (x_chunk @ W_u) + b_u.unsqueeze(1)
-        _fp16_min = torch.tensor(torch.finfo(torch.float16).min, dtype=gate.dtype, device=gate.device)
-        _limit    = torch.tensor(limit, dtype=gate.dtype, device=gate.device)
         gate = torch.minimum(torch.maximum(gate, _fp16_min), _limit)
         up   = torch.minimum(torch.maximum(up, -_limit), _limit)
         glu  = gate * torch.sigmoid(gate * alpha)
@@ -150,7 +150,6 @@ class QEffPrefillOnlyChunkedGptOssMLP(GptOssMLP):
     supports_moe_prefill_blocking = True
 
     def __qeff_init__(self):
-        # D2  expert_ids is computed with torch.arange() in every forward pass, emitting two dynamic Range nodes in ONNX that the AOT compiler cannot treat as constants  Pre-register expert_ids as a register_buffer; the compiler sees a single Constant node and can fold it at compile time
         num_experts = self.experts.num_experts
         num_nsp = getattr(self, "expert_blocking_num_nsp", 16)
         if num_experts % num_nsp != 0:
@@ -158,6 +157,35 @@ class QEffPrefillOnlyChunkedGptOssMLP(GptOssMLP):
 
         local_experts = num_experts // num_nsp
         expert_dim = self.experts.expert_dim
+        H = self.experts.hidden_size
+        N, L, I = num_nsp, local_experts, expert_dim
+
+        # Pre-register [N,L,...] weight buffers — eliminates view/transpose/contiguous in forward.
+        self.register_buffer(
+            "nsp_gate_proj",
+            self.experts.gate_proj.view(L, N, H, I).transpose(0, 1).contiguous(),  # [N, L, H, I]
+        )
+        self.register_buffer(
+            "nsp_up_proj",
+            self.experts.up_proj.view(L, N, H, I).transpose(0, 1).contiguous(),
+        )
+        self.register_buffer(
+            "nsp_down_proj",
+            self.experts.down_proj.view(L, N, I, H).transpose(0, 1).contiguous(),  # [N, L, I, H]
+        )
+        self.register_buffer(
+            "nsp_gate_proj_bias",
+            self.experts.gate_proj_bias.view(L, N, I).transpose(0, 1).contiguous(),  # [N, L, I]
+        )
+        self.register_buffer(
+            "nsp_up_proj_bias",
+            self.experts.up_proj_bias.view(L, N, I).transpose(0, 1).contiguous(),
+        )
+        self.register_buffer(
+            "nsp_down_proj_bias",
+            self.experts.down_proj_bias.view(L, N, H).transpose(0, 1).contiguous(),  # [N, L, H]
+        )
+        # expert_ids pre-registered as constant for compiler
         self.register_buffer(
             "expert_ids",
             torch.arange(num_nsp * local_experts).view(local_experts, num_nsp).T.contiguous().to(torch.int64),  # [N, L]
@@ -182,56 +210,33 @@ class QEffPrefillOnlyChunkedGptOssMLP(GptOssMLP):
             raise ValueError(f"num_experts ({num_experts}) must be divisible by expert_blocking_num_nsp ({num_nsp})")
 
         local_experts = num_experts // num_nsp
-        expert_dim = self.experts.expert_dim
-        # routing_weights_by_expert = (
-        #     routing_weights.transpose(0, 1).contiguous().view(local_experts, num_nsp, T).transpose(0, 1).contiguous()
-        # )
 
-        # expert_ids = (
-        #     torch.arange(local_experts, device=hidden.device, dtype=top_i.dtype).unsqueeze(0) * num_nsp
-        #     + torch.arange(num_nsp, device=hidden.device, dtype=top_i.dtype).unsqueeze(1)
-        # )  # [N, L]
+        # Use pre-registered [N,L,...] buffers — no view/transpose/contiguous at runtime.
+        W_g = self.nsp_gate_proj       # [N, L, H, I]
+        W_u = self.nsp_up_proj
+        W_d = self.nsp_down_proj       # [N, L, I, H]
+        b_g = self.nsp_gate_proj_bias  # [N, L, I]
+        b_u = self.nsp_up_proj_bias
+        b_d = self.nsp_down_proj_bias  # [N, L, H]
 
-        # # Cast→ReduceSum→Greater rather than .any() because the AOT compiler
-        # # currently rejects ReduceMax over the rank-4 bool tensor here.
-        # eq = top_i.unsqueeze(0).unsqueeze(0) == expert_ids.unsqueeze(-1).unsqueeze(-1)
-        # local_T2E = eq.to(top_i.dtype).sum(dim=-1) > 0  # [N, L, T]
-        # local_rw = (eq.to(top_w.dtype) * top_w.unsqueeze(0).unsqueeze(0)).sum(dim=-1)
-        
-        W_g = self.experts.gate_proj.view(local_experts, num_nsp, H, expert_dim).transpose(0, 1).contiguous()
-        W_u = self.experts.up_proj.view(local_experts, num_nsp, H, expert_dim).transpose(0, 1).contiguous()
-        W_d = self.experts.down_proj.view(local_experts, num_nsp, expert_dim, H).transpose(0, 1).contiguous()
-        b_g = self.experts.gate_proj_bias.view(local_experts, num_nsp, expert_dim).transpose(0, 1).contiguous()
-        b_u = self.experts.up_proj_bias.view(local_experts, num_nsp, expert_dim).transpose(0, 1).contiguous()
-        b_d = self.experts.down_proj_bias.view(local_experts, num_nsp, H).transpose(0, 1).contiguous()
-
-        # if self.expert_ids.shape != (num_nsp, local_experts):
-        #     self.register_buffer(
-        #         "expert_ids",
-        #         torch.arange(num_nsp * local_experts, device=hidden.device, dtype=torch.int64)
-        #         .view(local_experts, num_nsp)
-        #         .T.contiguous(),
-        #     )
-
+        # Cast→ReduceSum→Greater (avoids ReduceMax over rank-4 bool rejected by AOT compiler)
         matches   = (top_i.unsqueeze(0).unsqueeze(0)
                      == self.expert_ids.unsqueeze(-1).unsqueeze(-1))   # [N, L, T, K]
-        local_T2E = matches.any(-1)                                    # [N, L, T] bool
+        local_T2E = matches.to(top_i.dtype).sum(dim=-1) > 0           # [N, L, T]
 
         expert_out = hidden.new_zeros((num_nsp, T, H))
-        # routing_weights_unsqueezed = local_rw.unsqueeze(-1)
         for local_slot in range(local_experts):
-            T2Ei = local_T2E[:, local_slot, :] 
+            T2Ei = local_T2E[:, local_slot, :]
             rw   = (matches[:, local_slot].to(top_w.dtype) * top_w.unsqueeze(0)).sum(-1).unsqueeze(-1)  # [N, T, 1]
-            # T2Ei = routing_weights_by_expert[:, local_slot, :] > 0
             expert_out = _cumsum_scatter_gather_update_gptoss_expert_blocked(
                 x=hidden,
                 T2Ei=T2Ei,
-                W_g=W_g[:, local_slot],                          # [N, H, I]
+                W_g=W_g[:, local_slot],
                 W_u=W_u[:, local_slot],
                 W_d=W_d[:, local_slot],
-                b_g=b_g[:, local_slot],                     # [N, I]
+                b_g=b_g[:, local_slot],
                 b_u=b_u[:, local_slot],
-                b_d=b_d[:, local_slot],                     # [N, H]
+                b_d=b_d[:, local_slot],
                 routing_weight=rw,
                 expert_out=expert_out,
                 limit=self.experts.limit,
@@ -239,7 +244,7 @@ class QEffPrefillOnlyChunkedGptOssMLP(GptOssMLP):
                 packed_chunk_size=packed_chunk_size,
             )
 
-        expert_out_sum = torch.einsum("nth->th", expert_out)
+        expert_out_sum = expert_out.sum(dim=0)
         return expert_out_sum.view(B, S, H), router_logits
 
 

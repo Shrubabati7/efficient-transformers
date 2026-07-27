@@ -74,7 +74,7 @@ def update_running_softmax(
     if v_block is not None:
         output_updated = ((prev_denominator / current_denominator_updated).unsqueeze(-1)) * prev_output * torch.exp(
             delta_max.unsqueeze(-1)
-        ) + torch.matmul(prob, v_block)
+        ) + torch.matmul(prob, v_block.to(prob.dtype))
     else:
         output_updated = (
             ((prev_denominator / current_denominator_updated).unsqueeze(-1))
@@ -156,6 +156,9 @@ def blocked_kv_attention_forward(
             kv_len_block = kv_block_size
         end_index = start_index + kv_len_block
 
+        if kv_len_block <= 0:
+            continue
+
         skip_future = None
         if skip_kv:
             skip_future = (torch.tensor(start_index, device=query.device) > current_position).all()
@@ -165,7 +168,9 @@ def blocked_kv_attention_forward(
                     break
 
         k_block, v_block = past_key_value.read_only_blockedKV(start_index, end_index, layer_idx, cache_kwargs)
-        k_block_states, v_block_states = _get_kv_states(module, k_block, v_block)
+        if k_block.shape[-2] == 0:
+            continue
+        k_block_states, v_block_states = _get_kv_states(module, k_block, v_block, num_repeat=None)
 
         attn_weights_block = torch.matmul(query, k_block_states.transpose(2, 3)) * scaling
         # position bias needed for mpt model
@@ -206,7 +211,7 @@ def blocked_kv_attention_forward(
     if sinks is not None:
         _, _, output = update_running_softmax(current_max, sinks, current_denominator, output, None)
 
-    attn_output = output.transpose(1, 2).contiguous()
+    attn_output = output.to(query.dtype).transpose(1, 2).contiguous()
     attn_weights = None
 
     return attn_output, attn_weights
@@ -259,6 +264,9 @@ def blocked_kv_attention_forward_headpar_offline(
             kv_len_block = kv_block_size
         end_index = start_index + kv_len_block
 
+        if kv_len_block <= 0:
+            continue
+
         skip_future = None
         if skip_kv:
             skip_future = (torch.tensor(start_index, device=query.device) > current_position).all()
@@ -268,6 +276,8 @@ def blocked_kv_attention_forward_headpar_offline(
                     break
 
         k_block = past_key_value.read_only_blocked_K(start_index, end_index, layer_idx, cache_kwargs)
+        if k_block.shape[-2] == 0:
+            continue
         block_len = kv_len_block
         pad_len = 0
         if block_len % split != 0:
@@ -275,8 +285,8 @@ def blocked_kv_attention_forward_headpar_offline(
             k_block = nn.functional.pad(k_block, (0, 0, 0, pad_len))
             block_len += pad_len
         split_block_len = block_len // split
-
-        key_5d = k_block.view(batch_size, num_kv_heads, split, split_block_len, head_dim)
+        if split_block_len <= 0:
+            continue
         attn_weights_block = torch.matmul(query_5d, key_5d.transpose(-1, -2)) * scaling
 
         if pad_len > 0:
@@ -373,7 +383,7 @@ def blocked_kv_attention_forward_headpar_offline(
     attn_output = output.view(batch_size, num_kv_heads, num_kv_groups, seq_len, head_dim).reshape(
         batch_size, num_heads, seq_len, head_dim
     )
-    return attn_output.transpose(1, 2).contiguous(), None
+    return attn_output.to(query.dtype).transpose(1, 2).contiguous(), None
 
 def blocked_qkv_attention_forward_prefill_headpar_offline(
     module: nn.Module,
@@ -813,7 +823,7 @@ def blocked_q_attention_forward_prefill(
     """
     batch_size, num_heads, q_len, _ = query.shape
     num_q_blocks = max(1, _normalize_int(num_q_blocks))
-    key_states, value_states = _get_kv_states(module, key, value)
+    key_states, value_states = _get_kv_states(module, key, value, num_repeat=None)
     position_ids = cache_kwargs.get("position_ids")
 
     if hasattr(module, "config"):
@@ -949,7 +959,7 @@ def blocked_qkv_attention_forward(
                         break
 
             k_block, v_block = past_key_value.read_only_blockedKV(start_index, end_index, layer_idx, cache_kwargs)
-            k_block_states, v_block_states = _get_kv_states(module, k_block, v_block)
+            k_block_states, v_block_states = _get_kv_states(module, k_block, v_block, num_repeat=None)
 
             attn_weights_block = torch.matmul(q_block, k_block_states.transpose(2, 3)) * scaling
             # position bias needed for mpt model
@@ -1102,7 +1112,7 @@ def blocked_hqkv_attention_forward(
                             break
 
                 k_block, v_block = past_key_value.read_only_blockedKV(start_index, end_index, layer_idx, cache_kwargs)
-                k_block_states, v_block_states = _get_kv_states(module, k_block, v_block)
+                k_block_states, v_block_states = _get_kv_states(module, k_block, v_block, num_repeat=None)
 
                 k_g = k_block_states[:, h_start:h_end, :, :]
                 v_g = v_block_states[:, h_start:h_end, :, :]
@@ -1281,7 +1291,7 @@ def blocked_bhqkv_attention_forward(
                     k_block, v_block = past_key_value.read_only_blockedKV(
                         start_index, end_index, layer_idx, cache_kwargs
                     )
-                    k_block_states, v_block_states = _get_kv_states(module, k_block, v_block)
+                    k_block_states, v_block_states = _get_kv_states(module, k_block, v_block, num_repeat=None)
 
                     k_g = k_block_states[batch_start : batch_start + batch_len, h_start:h_end, :, :]
                     v_g = v_block_states[batch_start : batch_start + batch_len, h_start:h_end, :, :]
@@ -1366,7 +1376,7 @@ def blocked_h_attention_forward(
         head_block_size = num_heads
     num_head_blocks = math.ceil(num_heads / head_block_size)
 
-    key_states, value_states = _get_kv_states(module, key, value)
+    key_states, value_states = _get_kv_states(module, key, value, num_repeat=None)
 
     h_output_blocks = []
     h_attn_blocks = []
@@ -1436,7 +1446,7 @@ def blocked_q_attention_forward(
     """
     batch_size, num_heads, q_len, _ = query.shape
     num_q_blocks = max(1, _normalize_int(num_q_blocks))
-    key_states, value_states = _get_kv_states(module, key, value)
+    key_states, value_states = _get_kv_states(module, key, value, num_repeat=None)
 
     q_block_positions = [-(-i * q_len) // num_q_blocks for i in range(num_q_blocks)]
     q_output_blocks = []

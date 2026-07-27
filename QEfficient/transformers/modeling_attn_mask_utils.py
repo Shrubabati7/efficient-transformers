@@ -41,6 +41,12 @@ def _create_causal_mask(
         attention_mask = attention_mask.unsqueeze(1)
     else:
         query_indices = position_ids.unsqueeze(-1)
+        # Clamp target_length to be at least start_index+1 so arange is never empty.
+        # This can happen during ONNX tracing when past_seen_tokens=0.
+        if isinstance(target_length, torch.Tensor):
+            target_length = torch.maximum(target_length, torch.tensor(start_index + 1, dtype=target_length.dtype))
+        else:
+            target_length = max(target_length, start_index + 1)
         kv_indices = torch.arange(start=start_index, end=target_length).view(1, 1, -1)
         attention_mask = kv_indices > query_indices
         attention_mask = attention_mask.unsqueeze(1)

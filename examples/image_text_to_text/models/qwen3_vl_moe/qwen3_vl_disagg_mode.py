@@ -18,15 +18,16 @@ from transformers import AutoConfig, AutoProcessor
 from QEfficient import QEFFAutoModelForImageTextToText
 from QEfficient.generation.cloud_infer import QAICInferenceSession
 
-# model_id = "Qwen/Qwen3-VL-30B-A3B-Instruct"
-model_id = "tiny-random/qwen3-vl-moe"
+model_id = "Qwen/Qwen3-VL-235B-A22B-Instruct"
+# model_id = "tiny-random/qwen3-vl-moe"
 config = AutoConfig.from_pretrained(model_id)
 config.dtype = "float16"
+config.torch_dtype = torch.float16
 
 # For faster execution user can run with lesser layers, For Testing Purpose Only
-# config.vision_config.depth = 9
-# config.text_config.num_hidden_layers = 6
-# config.vision_config.deepstack_visual_indexes = [8]
+config.vision_config.depth = 9
+config.text_config.num_hidden_layers = 2
+config.vision_config.deepstack_visual_indexes = [8]
 
 qeff_model = QEFFAutoModelForImageTextToText.from_pretrained(
     model_id, attn_implementation="eager", kv_offload=True, config=config, dtype=torch.float16, layerwise=False
@@ -34,11 +35,45 @@ qeff_model = QEFFAutoModelForImageTextToText.from_pretrained(
 tokenizer = transformers.AutoTokenizer.from_pretrained(model_id)
 processor = AutoProcessor.from_pretrained(model_id)
 
-PREFILL_SEQ_LEN = 128
-CTX_LEN = 4096
+PREFILL_SEQ_LEN = 1024
+CTX_LEN = 2048
 BS = 1
 
-skip_vision = False
+NUM_KV_BLOCKS = 4
+NUM_Q_BLOCKS = 2
+HEAD_BLOCK_SIZE = 8
+PREFILL_BLOCK_CHUNKS = None
+PREFILL_MODE = None  # None, "online" or "qkv" depending on whether we want online prefill or headparallel prefill
+
+
+###############
+# Decode modes:
+# - standard attention - pass enable_blocking and blocking_mode
+# - head parallel blocking - pass  enable_blocking, blocking_mode: “kv” and kv_block_headpar_split: 0
+# - batch fold head parallel - pass enable_blocking, blocking_mode: “kv” and batch_fold: True
+
+
+def _decode_qaic_config() -> dict:
+    return {
+        "blocking_mode": "kv",
+        "num_kv_blocks": NUM_KV_BLOCKS,
+        # "kv_blocking_headpar_split": 0,  # 0 → resolved to num_cores at compile time
+        "batch_fold": True,
+        "ctx_len": CTX_LEN,
+    }
+
+
+def _qaic_config() -> dict:
+    cfg = _decode_qaic_config()
+    if PREFILL_MODE is None:
+        return cfg
+    cfg["prefill_block_chunks"] = PREFILL_BLOCK_CHUNKS
+    cfg["prefill_blocking_mode"] = PREFILL_MODE
+    cfg["prefill_n_rep_chunk"] = PREFILL_N_REP_CHUNK
+    return cfg
+
+
+skip_vision = True
 if not skip_vision:
     vision_qpc_path = qeff_model.compile(
         batch_size=BS,
@@ -57,30 +92,8 @@ if not skip_vision:
         use_onnx_subfunctions=True,
         layerwise=False,
     )
-
-prefill_qpc_path = qeff_model.compile(
-    batch_size=BS,
-    prefill_seq_len=PREFILL_SEQ_LEN,
-    ctx_len=CTX_LEN,
-    height=354,
-    width=536,
-    num_cores=16,
-    num_devices=1,
-    mxfp6_matmul=True,
-    mxint8_kv_cache=True,
-    retain_full_kv=True,
-    split_model_io=True,  # This should be used for disagg serving via VLLM
-    mos=1,
-    aic_enable_depth_first=True,
-    prefill_only=True,
-    enable_chunking=True,
-    skip_vision=True,
-    use_onnx_subfunctions=True,
-    layerwise=False,
-    layerwise_window_size=1,
-)
-
-
+decode_qaic_config = _qaic_config()
+print("decode", decode_qaic_config)
 decode_qpc_path = qeff_model.compile(
     batch_size=BS,
     prefill_seq_len=1,
@@ -90,170 +103,53 @@ decode_qpc_path = qeff_model.compile(
     num_cores=16,
     num_devices=1,
     mxfp6_matmul=True,
-    mxint8_kv_cache=True,
-    split_model_io=True,  # This should be used for disagg serving via VLLM
+    split_model_io=True,
     mos=1,
-    aic_enable_depth_first=True,
+    user_tiled=True,
     prefill_only=False,
     skip_vision=True,
-    use_onnx_subfunctions=True,
+    use_onnx_subfunctions=False,
     layerwise=False,
-    layerwise_window_size=1,
+    offload_pt_weights=False,
+    qaic_config=decode_qaic_config,
 )
 
-lang_prefill_session = QAICInferenceSession(prefill_qpc_path.get("lang_prefill_qpc_path"))
+################
+# Prefill modes:
+# - follow decode attention - pass nothing extra
+# - head parallel offline prefill - pass prefill_blocking_mode: “qkv”, prefill_block_chunks: 2
+# - online prefill - pass prefill_blocking_mode: “online”, prefill_block_chunks: 2
+PREFILL_MODE = "online"
+PREFILL_QL_CHUNK = 128
+PREFILL_BLOCK_CHUNKS = -(-PREFILL_SEQ_LEN // PREFILL_QL_CHUNK)
+PREFILL_N_REP_CHUNK = 4
+MOE_PREFILL_PACKED_CHUNK_SIZE = 256
+prefill_qaic_config = _qaic_config()
+print("prefill", prefill_qaic_config)
+
+# Skip prefill compile — decode-only run for trace collection
+prefill_qpc_path = None
+
+print(f"Decode qpc path {decode_qpc_path}")
+
 lang_decode_session = QAICInferenceSession(decode_qpc_path.get("lang_decode_qpc_path"))
 
-if skip_vision:
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "Tell me about yourself."},
-            ],
-        },
-    ]
-else:
-    ### IMAGE + TEXT ###
-    image_url = "https://picsum.photos/id/237/536/354"
-    image = Image.open(requests.get(image_url, stream=True).raw)
+# Synthetic decode run — no prefill needed, just measure decode latency
+num_layers = config.text_config.num_hidden_layers
+num_kv_heads = config.text_config.num_key_value_heads
+head_dim = config.text_config.hidden_size // config.text_config.num_attention_heads
 
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": image},
-                {"type": "text", "text": "Describe all the colors seen in the image."},
-                # {"type": "text", "text": "Can you describe the image in detail?"},
-            ],
-        },
-    ]
-    vision_session = QAICInferenceSession(vision_qpc_path.get("vision_qpc_path"))
-
-
-messages = [messages] * BS
-
-texts = [processor.apply_chat_template(msg, tokenize=False, add_generation_prompt=True) for msg in messages]
-
-image_inputs, video_inputs = process_vision_info(messages)
-inputs = processor(
-    text=texts,
-    images=image_inputs,
-    videos=video_inputs,
-    padding=True,
-    return_tensors="pt",
-)
-inputs = qeff_model.model.prepare_inputs_for_generation(inputs=inputs, prefill_seq_len=PREFILL_SEQ_LEN, batch_size=BS)
-
-pad_token_id = 1
-input_len = inputs["attention_mask"].sum(1, keepdims=True)
-input_ids_length = inputs["input_ids"].shape[1]
-num_chunks = -(input_ids_length // -PREFILL_SEQ_LEN)  # ceil divide without float
-padded_len = num_chunks * PREFILL_SEQ_LEN  # Convert to a multiple of prompt_len
-generation_len = CTX_LEN - input_len.max()
-print(f"generation_len : {generation_len}")
-generated_ids = np.full((BS, generation_len + 1), pad_token_id)
-
-
-inputs["input_ids"] = torch.nn.functional.pad(
-    inputs["input_ids"],
-    (0, padded_len - input_ids_length),
-    "constant",
-    pad_token_id,
-)
-inputs["attention_mask"] = torch.nn.functional.pad(
-    inputs["attention_mask"], (0, padded_len - input_ids_length), "constant", 0
-)
-
-for k, v in inputs.items():
-    inputs[k] = np.array(v)
-
-vision_inputs = {
-    k: v
-    for k, v in inputs.items()
-    if k in {"pixel_values", "image_masks", "image_input_idx", "valid_idx", "aspect_ratio_ids", "aspect_ratio_mask"}
-}
-
-vision_inputs_fp16 = {"pixel_values", "image_masks"}
-vision_inputs.update({k: vision_inputs[k].astype("float16") for k in vision_inputs_fp16 if k in vision_inputs})
-
-vision_start = perf_counter()
-vision_outputs = {}
-if vision_inputs:
-    vision_outputs = vision_session.run(vision_inputs)
-vision_end = perf_counter()
-
-lang_inputs = {k: v for k, v in inputs.items() if k not in vision_inputs}
-if "position_ids" in inputs:
-    lang_inputs["position_ids"] = inputs["position_ids"]
-    lang_inputs.pop("attention_mask")
-else:
-    lang_inputs["position_ids"] = np.where(
-        lang_inputs.pop("attention_mask"), np.arange(padded_len), -1
-    )  # Need to use -1 as position_ids for invalid tokens
-
-lang_inputs["image_idx"] = np.array([[0]])
-
-if not skip_vision:
-    lang_inputs["vision_embeds"] = vision_outputs["vision_embeds"]
-    lang_inputs["deepstack_features"] = vision_outputs["deepstack_features"]
-
-# RUN prefill
-lang_start = perf_counter()
-lang_prefill_session.set_buffers(vision_outputs)
-all_outputs = []
-chunk_inputs = lang_inputs.copy()
-for i in range(num_chunks):
-    chunk_inputs["input_ids"] = lang_inputs["input_ids"][:, i * PREFILL_SEQ_LEN : (i + 1) * PREFILL_SEQ_LEN]
-    chunk_inputs["position_ids"] = lang_inputs["position_ids"][..., i * PREFILL_SEQ_LEN : (i + 1) * PREFILL_SEQ_LEN]
-    outputs = lang_prefill_session.run(chunk_inputs)
-    for i in range(config.text_config.num_hidden_layers):
-        chunk_inputs[f"past_key.{i}"] = outputs[f"past_key.{i}_RetainedState"]
-        chunk_inputs[f"past_value.{i}"] = outputs[f"past_value.{i}_RetainedState"]
-    chunk_inputs["image_idx"] = outputs["image_idx_output"]
-prefill_time = perf_counter() - lang_start + vision_end - vision_start
-print(f"Prefill time : {prefill_time:.2f} secs")
-
-all_outputs.append(np.argmax(outputs["logits"]))
 decode_inputs = {
-    "input_ids": np.argmax(outputs["logits"]).reshape(1, 1),
-    "position_ids": np.max(lang_inputs["position_ids"], axis=-1, keepdims=True) + 1,
+    "input_ids":    np.zeros((BS, 1), dtype=np.int32),
+    "position_ids": np.zeros((BS, 1), dtype=np.int32),
 }
+for i in range(num_layers):
+    decode_inputs[f"past_key.{i}"]   = np.zeros((1, num_kv_heads, CTX_LEN, head_dim), dtype=np.float16)
+    decode_inputs[f"past_value.{i}"] = np.zeros((1, num_kv_heads, CTX_LEN, head_dim), dtype=np.float16)
 
-for i in range(config.text_config.num_hidden_layers):
-    decode_inputs[f"past_key.{i}"] = outputs[f"past_key.{i}_RetainedState"]
-    decode_inputs[f"past_value.{i}"] = outputs[f"past_value.{i}_RetainedState"]
+# warmup
+lang_decode_session.run(decode_inputs)
 
 st = perf_counter()
 decode_out = lang_decode_session.run(decode_inputs)
-print(f"time for first run of decode with KV as input = {perf_counter() - st} sec\n")
-
-all_outputs.append(np.argmax(decode_out["logits"]))
-pos_id = np.max(decode_inputs["position_ids"], axis=-1, keepdims=True) + 1
-loop_decode_inputs = {
-    "input_ids": np.argmax(decode_out["logits"]).reshape(1, 1),
-    "position_ids": pos_id,
-}
-
-for i in range(config.text_config.num_hidden_layers):
-    loop_decode_inputs[f"past_key.{i}"] = decode_out[f"past_key.{i}_RetainedState"]
-    loop_decode_inputs[f"past_value.{i}"] = decode_out[f"past_value.{i}_RetainedState"]
-
-
-st = perf_counter()
-for i in range(generation_len - 2):
-    decode_out = lang_decode_session.run(loop_decode_inputs)
-    all_outputs.append(np.argmax(decode_out["logits"]))
-    pos_id += 1
-    for j in range(config.text_config.num_hidden_layers):
-        loop_decode_inputs[f"past_key.{j}"] = decode_out[f"past_key.{j}_RetainedState"]
-        loop_decode_inputs[f"past_value.{j}"] = decode_out[f"past_value.{j}_RetainedState"]
-    loop_decode_inputs.update(
-        {
-            "input_ids": np.argmax(decode_out["logits"]).reshape(1, 1),
-            "position_ids": pos_id,
-        }
-    )
-ft = perf_counter()
-print(f"decode tok/sec={(generation_len - 2) / (ft - st)}")
-print(f"\noutput\n{tokenizer.decode(all_outputs)}")
+print(f"Decode latency (first measured) = {perf_counter() - st:.4f} sec")

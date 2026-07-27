@@ -1599,6 +1599,13 @@ class _QEffAutoModelForImageTextToTextDualQPC:
             offload_pt_weights = kwargs.get("offload_pt_weights", True)
 
         if not skip_lang:
+            # Propagate skip_vision to the wrapper so vision tensors are excluded
+            # from the ONNX graph (and thus from retained state) when not needed.
+            if hasattr(self.lang_model, 'model') and hasattr(self.lang_model.model, 'skip_vision'):
+                self.lang_model.model.skip_vision = bool(skip_vision)
+            # Include skip_vision in the export hash so a new ONNX is generated
+            # when skip_vision changes (avoids reusing a vision-included ONNX).
+            self.lang_model.hash_params["skip_vision"] = bool(skip_vision)
             self.lang_model.export(
                 inputs["lang"],
                 output_names["lang"],

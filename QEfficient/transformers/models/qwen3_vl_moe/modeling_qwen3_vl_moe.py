@@ -808,6 +808,7 @@ class QEffQwen3VLMoeTextExperts(Qwen3VLMoeTextExperts):
 class QEffQwen3VLDecoderWrapper(nn.Module):
     _deepstack = None
     _vision_mask = None
+    skip_vision: bool = False  # set to True at export time to remove vision retained state
 
     def __init__(self, model):
         super().__init__()
@@ -841,27 +842,30 @@ class QEffQwen3VLDecoderWrapper(nn.Module):
             inputs_embeds = inputs_embeds
 
         if not is_layerwise_active():
-            # Default (non-layerwise) path: image merge + full decoder + lm_head in
-            # a single forward, identical to the pre-layerwise behavior/output contract.
             B, N, C = inputs_embeds.shape
-            selected = input_ids == self.model.config.image_token_id
-            indices1 = selected.to(torch.int64).cumsum(1) - 1
-            indices1 = torch.where(indices1 != -1, indices1 + image_idx, indices1)
-            indices0 = torch.arange(selected.unsqueeze(0).shape[0]).view(-1, 1)
-            image_features_expanded = vision_embeds.reshape(-1, C).unsqueeze(0)[indices0, indices1]
+            if self.skip_vision:
+                # Vision tensors not needed — bypass all vision indexing so
+                # vision_embeds/deepstack_features don't appear as retained state.
+                visual_pos_masks = None
+                deepstack_visual_embeds = None
+                image_idx_out = image_idx
+            else:
+                selected = input_ids == self.model.config.image_token_id
+                indices1 = selected.to(torch.int64).cumsum(1) - 1
+                indices1 = torch.where(indices1 != -1, indices1 + image_idx, indices1)
+                indices0 = torch.arange(selected.unsqueeze(0).shape[0]).view(-1, 1)
+                image_features_expanded = vision_embeds.reshape(-1, C).unsqueeze(0)[indices0, indices1]
 
-            num_features, bs, split_size, C = deepstack_features.shape
-            x = deepstack_features.reshape(num_features, bs * split_size, C)
-            deepstack_features_expanded = x[:, indices1, :]
-            image_input_embeds = torch.where(selected.unsqueeze(-1), image_features_expanded, inputs_embeds)
-            inputs_embeds = torch.where(input_ids.shape[1] == torch.tensor(1), inputs_embeds, image_input_embeds)
+                num_features, bs, split_size, C = deepstack_features.shape
+                x = deepstack_features.reshape(num_features, bs * split_size, C)
+                deepstack_features_expanded = x[:, indices1, :]
+                image_input_embeds = torch.where(selected.unsqueeze(-1), image_features_expanded, inputs_embeds)
+                inputs_embeds = torch.where(input_ids.shape[1] == torch.tensor(1), inputs_embeds, image_input_embeds)
 
-            image_mask = selected.clone()
-            visual_pos_masks = None
-            deepstack_visual_embeds = None
-            if image_mask is not None:
-                visual_pos_masks = image_mask
-                deepstack_visual_embeds = deepstack_features_expanded
+                image_mask = selected.clone()
+                visual_pos_masks = image_mask if image_mask is not None else None
+                deepstack_visual_embeds = deepstack_features_expanded if image_mask is not None else None
+                image_idx_out = (indices1.max() + 1).unsqueeze(0).unsqueeze(0)
 
             outputs = self.language_model(
                 inputs_embeds=inputs_embeds,
@@ -876,8 +880,7 @@ class QEffQwen3VLDecoderWrapper(nn.Module):
             logit_index = position_ids[0].to(torch.int32).argmax(1, keepdim=True)
             hidden_states = outputs.last_hidden_state[torch.arange(position_ids[0].shape[0]).view(-1, 1), logit_index]
             logits = self.model.lm_head(hidden_states)
-            image_idx = (indices1.max() + 1).unsqueeze(0).unsqueeze(0)
-            return logits, vision_embeds, deepstack_features, image_idx, outputs.past_key_values
+            return logits, vision_embeds, deepstack_features, image_idx_out, outputs.past_key_values
 
         if QEffQwen3VLMoeTextModel._start == 0:
             B, N, C = inputs_embeds.shape
