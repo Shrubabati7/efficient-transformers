@@ -110,7 +110,7 @@ def _cumsum_scatter_gather_update_gptoss_expert_blocked(
     batch_size, seq_len = T2Ei.shape
     packed_chunk_size = max(1, min(packed_chunk_size, seq_len))
     matched_idx  = _build_matched_idx_from_cumsum(T2Ei)
-    valid_rows   = T2Ei.to(torch.int32).sum(dim=1).unsqueeze(1)
+    valid_rows   = torch.einsum("bt->b", T2Ei.to(torch.int32)).unsqueeze(1)
     row_range    = torch.arange(packed_chunk_size, dtype=torch.int32, device=x.device).unsqueeze(0)
     x_expanded   = x.unsqueeze(0).expand(batch_size, -1, -1)
     _fp16_min    = torch.tensor(torch.finfo(torch.float16).min, dtype=x.dtype, device=x.device)
@@ -222,12 +222,12 @@ class QEffPrefillOnlyChunkedGptOssMLP(GptOssMLP):
         # Cast→ReduceSum→Greater (avoids ReduceMax over rank-4 bool rejected by AOT compiler)
         matches   = (top_i.unsqueeze(0).unsqueeze(0)
                      == self.expert_ids.unsqueeze(-1).unsqueeze(-1))   # [N, L, T, K]
-        local_T2E = matches.to(top_i.dtype).sum(dim=-1) > 0           # [N, L, T]
+        local_T2E = torch.einsum("nltk->nlt", matches.to(top_i.dtype)) > 0           # [N, L, T]
 
         expert_out = hidden.new_zeros((num_nsp, T, H))
         for local_slot in range(local_experts):
             T2Ei = local_T2E[:, local_slot, :]
-            rw   = (matches[:, local_slot].to(top_w.dtype) * top_w.unsqueeze(0)).sum(-1).unsqueeze(-1)  # [N, T, 1]
+            rw   = torch.einsum("ntk,tk->nt", matches[:, local_slot].to(top_w.dtype), top_w).unsqueeze(-1)  # [N, T, 1]
             expert_out = _cumsum_scatter_gather_update_gptoss_expert_blocked(
                 x=hidden,
                 T2Ei=T2Ei,
@@ -244,7 +244,7 @@ class QEffPrefillOnlyChunkedGptOssMLP(GptOssMLP):
                 packed_chunk_size=packed_chunk_size,
             )
 
-        expert_out_sum = expert_out.sum(dim=0)
+        expert_out_sum = torch.einsum("nth->th", expert_out)
         return expert_out_sum.view(B, S, H), router_logits
 
 

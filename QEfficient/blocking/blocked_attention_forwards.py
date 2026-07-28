@@ -503,8 +503,9 @@ def blocked_qkv_attention_forward_prefill_headpar_offline(
             o = acc["o_acc"].view(batch_size, num_kv_heads, split, rc * tc, head_dim)
             split_max    = m.max(dim=2).values
             split_weight = torch.exp(m - split_max.unsqueeze(2))
-            split_sum    = (split_weight * s).sum(dim=2)
-            split_out    = (split_weight.unsqueeze(-1) * o).sum(dim=2)
+            # einsum avoids dynamic-axes ReduceSum rejected by qaic-compile with -sub-functions
+            split_sum    = torch.einsum("bhsq,bhsq->bhq", split_weight, s)
+            split_out    = torch.einsum("bhsq,bhsqd->bhqd", split_weight, o)
             r_chunks.append((split_out / split_sum.unsqueeze(-1)).view(batch_size, num_kv_heads, rc, tc, head_dim))
 
         t_chunks.append(torch.cat(r_chunks, dim=2))
