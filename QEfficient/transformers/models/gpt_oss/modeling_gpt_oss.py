@@ -86,7 +86,6 @@ def _cumsum_scatter_gather_update_gptoss_expert_blocked(
     b_g: torch.Tensor,
     b_u: torch.Tensor,
     b_d: torch.Tensor,
-    routing_weight: torch.Tensor,
     expert_out: torch.Tensor,
     limit: float,
     alpha: float,
@@ -96,6 +95,8 @@ def _cumsum_scatter_gather_update_gptoss_expert_blocked(
 
     Same algorithm as the Qwen3-MOE version but with GPT-OSS biases and GLU
     activation (clamped gate/up, ``(up + 1) * gate * sigmoid(gate * alpha)``).
+    Routing weight is NOT applied here; the caller applies it once after all
+    slot dispatches to avoid a memory-bound Gather inside the innermost chunk loop.
 
     Shapes:
         x               : [T, H]
@@ -104,7 +105,6 @@ def _cumsum_scatter_gather_update_gptoss_expert_blocked(
         W_d             : [num_nsp, I, H]
         b_g, b_u        : [num_nsp, I]
         b_d             : [num_nsp, H]
-        routing_weight  : [num_nsp, T, 1]
         expert_out      : [num_nsp, T, H]         (accumulator, in-out)
     """
     batch_size, seq_len = T2Ei.shape
@@ -121,16 +121,14 @@ def _cumsum_scatter_gather_update_gptoss_expert_blocked(
         chunk_matched_idx = matched_idx[:, packed_start:packed_stop]
         x_chunk          = CtxGatherFunc3DGeneralized.apply(x_expanded, chunk_matched_idx)
 
-        gate = (x_chunk @ W_g) + b_g.unsqueeze(1)
-        up   = (x_chunk @ W_u) + b_u.unsqueeze(1)
+        gate = torch.bmm(x_chunk, W_g) + b_g.unsqueeze(1)
+        up   = torch.bmm(x_chunk, W_u) + b_u.unsqueeze(1)
         gate = torch.minimum(torch.maximum(gate, _fp16_min), _limit)
         up   = torch.minimum(torch.maximum(up, -_limit), _limit)
         glu  = gate * torch.sigmoid(gate * alpha)
         intermediate = (up + 1) * glu
-        down_chunk   = (intermediate @ W_d) + b_d.unsqueeze(1)
+        down_chunk   = torch.bmm(intermediate, W_d) + b_d.unsqueeze(1)
 
-        rw_chunk         = CtxGatherFunc3DGeneralized.apply(routing_weight, chunk_matched_idx)
-        down_chunk       = down_chunk * rw_chunk
         expert_out_chunk = CtxGatherFunc3DGeneralized.apply(expert_out, chunk_matched_idx)
         updated_chunk    = expert_out_chunk + down_chunk
 
@@ -191,17 +189,22 @@ class QEffPrefillOnlyChunkedGptOssMLP(GptOssMLP):
             torch.arange(num_nsp * local_experts).view(local_experts, num_nsp).T.contiguous().to(torch.int64),  # [N, L]
         )
 
-    def forward(self, hidden: torch.Tensor):
+    def forward(self, hidden: torch.Tensor, local_T2E: Optional[torch.Tensor] = None):
+        """Forward pass.
+
+        Args:
+            hidden:    [B, S, H] hidden states from layernorm.
+            local_T2E: Optional [N, L, T] bool token-to-expert assignment.
+                       When provided, the embedded router (topk + softmax +
+                       mask-build) is bypassed entirely and no routing-weight
+                       scaling is applied — the output is raw ``expert_out.sum(dim=0)``,
+                       matching the bench_without_fix microbenchmark interface and
+                       removing the topk serialization barrier from the ONNX graph.
+                       When None (default), the embedded router runs as before.
+        """
         B, S, H = hidden.shape
         T = B * S
         hidden = hidden.view(T, H)
-
-        router_logits = F.linear(hidden, self.router.weight, self.router.bias)
-        top_w, top_i = torch.topk(router_logits, self.router.top_k, dim=-1)
-        top_w = torch.nn.functional.softmax(top_w, dim=1, dtype=top_w.dtype)
-
-        # routing_weights = torch.zeros_like(router_logits)
-        # routing_weights.scatter_(1, top_i, top_w)
 
         num_experts = self.experts.num_experts
         num_nsp = getattr(self, "expert_blocking_num_nsp", num_experts)
@@ -211,7 +214,6 @@ class QEffPrefillOnlyChunkedGptOssMLP(GptOssMLP):
 
         local_experts = num_experts // num_nsp
 
-        # Use pre-registered [N,L,...] buffers — no view/transpose/contiguous at runtime.
         W_g = self.nsp_gate_proj       # [N, L, H, I]
         W_u = self.nsp_up_proj
         W_d = self.nsp_down_proj       # [N, L, I, H]
@@ -219,15 +221,23 @@ class QEffPrefillOnlyChunkedGptOssMLP(GptOssMLP):
         b_u = self.nsp_up_proj_bias
         b_d = self.nsp_down_proj_bias  # [N, L, H]
 
-        # Cast→ReduceSum→Greater (avoids ReduceMax over rank-4 bool rejected by AOT compiler)
-        matches   = (top_i.unsqueeze(0).unsqueeze(0)
-                     == self.expert_ids.unsqueeze(-1).unsqueeze(-1))   # [N, L, T, K]
-        local_T2E = torch.einsum("nltk->nlt", matches.to(top_i.dtype)) > 0           # [N, L, T]
+        router_logits = None
+        matches = None
+        top_w = None
+
+        if local_T2E is None:
+            # Embedded router path — topk barrier present in ONNX graph.
+            router_logits = F.linear(hidden, self.router.weight, self.router.bias)
+            top_w, top_i = torch.topk(router_logits, self.router.top_k, dim=-1)
+            top_w = torch.nn.functional.softmax(top_w, dim=1, dtype=top_w.dtype)
+            # Cast→ReduceSum→Greater (avoids ReduceMax over rank-4 bool rejected by AOT compiler)
+            matches   = (top_i.unsqueeze(0).unsqueeze(0)
+                         == self.expert_ids.unsqueeze(-1).unsqueeze(-1))   # [N, L, T, K]
+            local_T2E = torch.einsum("nltk->nlt", matches.to(top_i.dtype)) > 0  # [N, L, T]
 
         expert_out = hidden.new_zeros((num_nsp, T, H))
         for local_slot in range(local_experts):
             T2Ei = local_T2E[:, local_slot, :]
-            rw   = torch.einsum("ntk,tk->nt", matches[:, local_slot].to(top_w.dtype), top_w).unsqueeze(-1)  # [N, T, 1]
             expert_out = _cumsum_scatter_gather_update_gptoss_expert_blocked(
                 x=hidden,
                 T2Ei=T2Ei,
@@ -237,12 +247,17 @@ class QEffPrefillOnlyChunkedGptOssMLP(GptOssMLP):
                 b_g=b_g[:, local_slot],
                 b_u=b_u[:, local_slot],
                 b_d=b_d[:, local_slot],
-                routing_weight=rw,
                 expert_out=expert_out,
                 limit=self.experts.limit,
                 alpha=self.experts.alpha,
                 packed_chunk_size=packed_chunk_size,
             )
+
+        if matches is not None and top_w is not None:
+            # Apply routing weights once after all slot dispatches — avoids an extra
+            # memory-bound Gather(routing_weight) inside the innermost chunk loop.
+            routing_weight = torch.einsum("nltk,tk->nt", matches.to(top_w.dtype), top_w).unsqueeze(-1)  # [N, T, 1]
+            expert_out = expert_out * routing_weight
 
         expert_out_sum = torch.einsum("nth->th", expert_out)
         return expert_out_sum.view(B, S, H), router_logits
@@ -510,7 +525,7 @@ class QEffGptOssMLP(GptOssMLP):
         return experts_out, router_logits
 
     # ------------------- Gather based, weights as activation approach, With Seperate Gate, up Projections ---------------
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, local_T2E=None):
         bs, seq_len, _ = hidden_states.shape
         hidden_states = hidden_states.view(bs * seq_len, self.experts.hidden_size)
 
@@ -1084,6 +1099,7 @@ class QEffGptOssDecoderLayer(GptOssDecoderLayer):
         sliding_mask=None,
         sin_cached=None,
         cos_cached=None,
+        local_T2E: Optional[torch.Tensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.Tensor]:
         residual = hidden_states
@@ -1109,7 +1125,7 @@ class QEffGptOssDecoderLayer(GptOssDecoderLayer):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states, _ = self.mlp(hidden_states)  # diff with llama: router scores
+        hidden_states, _ = self.mlp(hidden_states, local_T2E=local_T2E)  # diff with llama: router scores
         hidden_states = hidden_states.reshape(residual.shape)
         hidden_states = residual + hidden_states
         outputs = (hidden_states,)
@@ -1464,3 +1480,4 @@ class QEffGptOssForCausalLM(GptOssForCausalLM):
             },
         ]
         return specializations
+        
