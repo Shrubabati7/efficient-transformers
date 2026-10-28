@@ -45,6 +45,7 @@ from QEfficient.transformers.moe import (
     QEffMoEBlockMixin,
     build_canonical_expert_weights,
     delete_module_attrs,
+    gptoss_clamp,
     gptoss_clamped_glu_mlp,
     resolve_routing,
     unpack_moe_weights_from_expert_parallel,
@@ -190,8 +191,8 @@ class QEffGptOssMLP(QEffMoEBlockMixin, GptOssMLP):
                     up = xb @ W_u
                     if b_u is not None:
                         up = up + b_u
-                    gate = gate.clamp(min=_fp16_min, max=limit)
-                    up = up.clamp(min=-limit, max=limit)
+                    gate = gptoss_clamp(gate, min_value=_fp16_min, max_value=limit)
+                    up = gptoss_clamp(up, min_value=-limit, max_value=limit)
                     glu = gate * torch.sigmoid(gate * alpha)
                     intermediate = (up + 1) * glu
                     down = intermediate @ W_d
@@ -206,8 +207,8 @@ class QEffGptOssMLP(QEffMoEBlockMixin, GptOssMLP):
                         up_s = xb @ W_u[:, i_start:i_end]
                         if b_u is not None:
                             up_s = up_s + b_u[i_start:i_end]
-                        gate_s = gate_s.clamp(min=_fp16_min, max=limit)
-                        up_s = up_s.clamp(min=-limit, max=limit)
+                        gate_s = gptoss_clamp(gate_s, min_value=_fp16_min, max_value=limit)
+                        up_s = gptoss_clamp(up_s, min_value=-limit, max_value=limit)
                         glu_s = gate_s * torch.sigmoid(gate_s * alpha)
                         intermediate_s = (up_s + 1) * glu_s
                         down = down + intermediate_s @ W_d[i_start:i_end, :]
@@ -464,6 +465,7 @@ class QEffPrefillOnlyChunkedGptOssAttention(GptOssAttention):
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
             sliding_window=self.sliding_window,
+            sinks=self.sinks,
             s_aux=self.sinks,  # diff with Llama
             layer_idx=self.layer_idx,
             blocking_config=blocking_config,
